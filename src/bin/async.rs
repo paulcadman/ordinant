@@ -1,60 +1,68 @@
 extern crate websocket;
+extern crate futures;
+extern crate tokio_core;
 extern crate bus;
 
-use std::thread;
-use bus::Bus;
-use std::sync::{Arc, Mutex};
-use websocket::OwnedMessage;
-use websocket::sync::Server;
+use std::fmt::Debug;
+
+use websocket::message::{Message, OwnedMessage};
+use websocket::server::InvalidConnection;
+use websocket::async::Server;
+
+use tokio_core::reactor::{Handle, Core};
+use futures::{Future, Sink, Stream};
 
 fn main() {
-	let server = Server::bind("127.0.0.1:2794").unwrap();
-	let bus = Arc::new(Mutex::new(Bus::new(10)));
+	let mut core = Core::new().unwrap();
+	let handle = core.handle();
+	// bind to the server
+	let server = Server::bind("127.0.0.1:2794", &handle).unwrap();
 
-	for request in server.filter_map(Result::ok) {
-		let mut rx = bus.lock().unwrap().add_rx();
-		let bus = bus.clone();
+	// time to build the server's future
+	// this will be a struct containing everything the server is going to do
 
-		thread::spawn(move || {
-			let mut client = request.accept().unwrap();
+	// a stream of incoming connections
+	let f = server.incoming()
+        // we don't wanna save the stream if it drops
+        .map_err(|InvalidConnection { error, .. }| error)
+        .for_each(|(upgrade, addr)| {
+            println!("Got a connection from: {}", addr);
 
-			let message = OwnedMessage::Text("Welcome".to_string());
-			client.send_message(&message).unwrap();
+            // accept the request to be a ws connection if it does
+            let f = upgrade
+                .accept()
+                // send a greeting!
+                .and_then(|(s, _)| s.send(Message::text("Hello World!").into()))
+                // simple echo server impl
+                .and_then(|s| {
+                    let (sink, stream) = s.split();
+                    stream
+                    .take_while(|m| Ok(!m.is_close()))
+                    .filter_map(|m| {
+                        println!("Message from Client: {:?}", m);
+                        match m {
+                            OwnedMessage::Ping(p) => Some(OwnedMessage::Pong(p)),
+                            OwnedMessage::Pong(_) => None,
+                            _ => Some(m),
+                        }
+                    })
+                    .forward(sink)
+                    .and_then(|(_, sink)| {
+                        sink.send(OwnedMessage::Close(None))
+                    })
+                });
 
-			let (mut receiver, sender) = client.split().unwrap();
-			let sender = Arc::new(Mutex::new(sender));
+            spawn_future(f, "Client Status", &handle);
+            Ok(())
+        });
 
-			let broadcast_sender = sender.clone();
-			thread::spawn(move || {
-				for message in rx.iter() {
-					broadcast_sender.lock().unwrap().send_message(&message).unwrap();
-				}
-			});
+	core.run(f).unwrap();
+}
 
-			for message in receiver.incoming_messages() {
-				let message = message.unwrap();
-
-				match message {
-					OwnedMessage::Close(_) => {
-						let message = OwnedMessage::Close(None);
-						{
-							sender.lock().unwrap().send_message(&message).unwrap();
-						}
-						return;
-					}
-					OwnedMessage::Ping(ping) => {
-						let message = OwnedMessage::Pong(ping);
-						{
-							sender.lock().unwrap().send_message(&message).unwrap();
-						}
-					}
-					_ => {
-						{
-							bus.lock().unwrap().broadcast(message.clone());
-						}
-					}
-				}
-			}
-		});
-	}
+fn spawn_future<F, I, E>(f: F, desc: &'static str, handle: &Handle)
+	where F: Future<Item = I, Error = E> + 'static,
+	      E: Debug
+{
+	handle.spawn(f.map_err(move |e| println!("{}: '{:?}'", desc, e))
+	              .map(move |_| println!("{}: Finished.", desc)));
 }
